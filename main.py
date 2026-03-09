@@ -24,6 +24,67 @@ OPENAI_MODEL = "gpt-4.1-nano"
 # GPT Übersetzung
 # --------------------------------------------------
 
+async def is_whale_buy_sell(text: str):
+
+    if not OPENAI_API_KEY:
+        return False
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    prompt = (
+        "Beurteile folgende Crypto News.\n\n"
+        "Antwort NUR mit YES oder NO.\n\n"
+        "YES = Diese Nachricht handelt davon, dass eine Person, Firma, Institution "
+        "oder ein Whale Bitcoin, Ethereum oder andere Kryptowährungen kauft oder verkauft.\n\n"
+        "NO = Alles andere.\n\n"
+        "Beispiele YES:\n"
+        "- Michael Saylor buys $1B Bitcoin\n"
+        "- Company buys ETH\n"
+        "- Fund sells BTC\n\n"
+        "Beispiele NO:\n"
+        "- ETF news\n"
+        "- regulation\n"
+        "- hacks\n"
+        "- market analysis\n"
+        "- announcements\n"
+    )
+
+    body = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0,
+        "max_tokens": 3
+    }
+
+    try:
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                OPENAI_API_URL,
+                headers=headers,
+                json=body,
+            )
+
+        data = resp.json()
+
+        decision = data["choices"][0]["message"]["content"].strip()
+
+        print("Whale Buy/Sell Bewertung:", decision)
+
+        return decision == "YES"
+
+    except Exception as e:
+
+        print("Filter Fehler:", e)
+
+        return False
+
 async def translate_tweet(text: str):
 
     if not OPENAI_API_KEY:
@@ -173,6 +234,13 @@ async def process_tweets(payload):
         last_text = text
 
         print("Neuer Tweet:", text)
+
+        # Whale Buy/Sell Filter
+        is_whale_trade = await is_whale_buy_sell(text)
+
+        if is_whale_trade:
+            print("Whale Buy/Sell ignoriert:", text)
+            continue
 
         # Übersetzen
         title, summary = await translate_tweet(text)

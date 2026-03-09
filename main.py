@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse
 import json
 import os
@@ -9,11 +9,10 @@ load_dotenv()
 
 app = FastAPI()
 
-# In-Memory-Cache: verarbeitete Tweet-IDs und letzter Text
+# Cache gegen doppelte Tweets
 processed_ids = set()
-last_text = None  # Text des zuletzt verarbeiteten Tweets
+last_text = None
 
-# Umgebungsvariablen lesen
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
@@ -21,15 +20,14 @@ OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_MODEL = "gpt-4.1-nano"
 
 
-async def translate_tweet(text: str) -> tuple[str, str]:
-    """
-    Ruft OpenAI auf und gibt (title_de, summary_de) zurück.
-    Bei Fehlern wird ein Fallback verwendet.
-    """
+# --------------------------------------------------
+# GPT Übersetzung
+# --------------------------------------------------
+
+async def translate_tweet(text: str):
 
     if not OPENAI_API_KEY:
-        # Fallback, wenn lokal kein Key gesetzt ist
-        return text[:120], "Automatischer Hinweis: Kein OPENAI_API_KEY gesetzt."
+        return text[:120], "Automatische Zusammenfassung nicht verfügbar."
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -37,12 +35,11 @@ async def translate_tweet(text: str) -> tuple[str, str]:
     }
 
     system_prompt = (
-    "Du bist ein deutschsprachiger News-Redakteur.\n"
-    "Übersetze die Überschrift des folgenden Tweets möglichst nah am englischen Original ins Deutsche "
-    "und fasse den Inhalt in 1–3 deutschen Sätzen neutral zusammen.\n"
-    "Antworte im JSON-Format: {\"title\": \"<kurze deutsche Überschrift>\", \"summary\": \"<deutsche Zusammenfassung>\"}."
-)
-
+        "Du bist ein deutschsprachiger News-Redakteur.\n"
+        "Übersetze die Überschrift des Tweets möglichst nah ins Deutsche "
+        "und fasse den Inhalt in 1-3 Sätzen neutral zusammen.\n"
+        "Antworte als JSON: {\"title\": \"...\", \"summary\": \"...\"}"
+    )
 
     body = {
         "model": OPENAI_MODEL,
@@ -54,98 +51,153 @@ async def translate_tweet(text: str) -> tuple[str, str]:
     }
 
     try:
+
         async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(OPENAI_API_URL, headers=headers, json=body)
+            resp = await client.post(
+                OPENAI_API_URL,
+                headers=headers,
+                json=body,
+            )
+
             resp.raise_for_status()
-            data = resp.json()
+
+        data = resp.json()
 
         content = data["choices"][0]["message"]["content"]
+
         obj = json.loads(content)
-        title_de = obj.get("title", text[:120])
-        summary_de = obj.get(
-            "summary",
-            "Automatische Zusammenfassung nicht verfügbar.",
-        )
-        return title_de, summary_de
+
+        title = obj.get("title", text[:120])
+        summary = obj.get("summary", "Zusammenfassung nicht verfügbar.")
+
+        return title, summary
 
     except Exception as e:
-        print("Fehler bei GPT-Übersetzung:", e)
-        fallback_title = text[:120]
-        fallback_summary = "Automatischer Hinweis: GPT-Übersetzung aktuell nicht verfügbar."
-        return fallback_title, fallback_summary
+
+        print("GPT Fehler:", e)
+
+        return text[:120], "Automatische Übersetzung aktuell nicht verfügbar."
 
 
-async def send_to_discord(url: str, title_de: str, summary_de: str) -> None:
-    """
-    Schickt zwei Nachrichten:
-    1) nur den Tweet-Link -> Discord rendert X-Embed mit Bild/Video
-    2) deutsche Übersetzung als normaler Text darunter
-    """
+# --------------------------------------------------
+# Discord Versand
+# --------------------------------------------------
+
+async def send_to_discord(url: str, title: str, summary: str):
 
     if not DISCORD_WEBHOOK_URL:
-        print("WARNUNG: DISCORD_WEBHOOK_URL ist nicht gesetzt.")
+        print("Discord Webhook fehlt.")
         return
 
     async with httpx.AsyncClient(timeout=10) as client:
-        # 1. Nachricht: nur Link
+
         try:
+
+            # Tweet Embed
             r1 = await client.post(
                 DISCORD_WEBHOOK_URL,
                 json={"content": url},
             )
-            r1.raise_for_status()
-        except Exception as e:
-            print("Fehler beim Senden der Link-Nachricht an Discord:", e)
 
-        # 2. Nachricht: Übersetzung
-        text = f"**DE:** {title_de}\n\n{summary_de}\n\nQuelle: WatcherGuru • Übersetzt per KI"
+            print("Discord embed status:", r1.status_code)
+
+        except Exception as e:
+
+            print("Discord Embed Fehler:", e)
+
         try:
+
+            text = f"**DE:** {title}\n\n{summary}\n\nQuelle: WatcherGuru • Übersetzt per KI"
+
             r2 = await client.post(
                 DISCORD_WEBHOOK_URL,
-                json={"content": text[:2000]},  # Safety gegen Discord-Limit
+                json={"content": text[:2000]},
             )
-            r2.raise_for_status()
-        except Exception as e:
-            print("Fehler beim Senden der Übersetzungs-Nachricht an Discord:", e)
 
+            print("Discord text status:", r2.status_code)
+
+        except Exception as e:
+
+            print("Discord Text Fehler:", e)
+
+
+# --------------------------------------------------
+# Tweet Verarbeitung
+# --------------------------------------------------
+
+async def process_tweets(payload):
+
+    global last_text
+    global processed_ids
+
+    print("Webhook Payload:", payload)
+
+    tweets = []
+
+    # verschiedene mögliche Payload Strukturen
+    if isinstance(payload.get("data"), dict):
+
+        tweets = payload["data"].get("tweets", [])
+
+    elif isinstance(payload.get("data"), list):
+
+        tweets = payload["data"]
+
+    else:
+
+        tweets = payload.get("tweets", [])
+
+    print("Tweets erkannt:", len(tweets))
+
+    for t in tweets:
+
+        tweet_id = t.get("id")
+        text = t.get("text", "")
+        url = t.get("url") or t.get("twitterUrl")
+
+        if not text or not url:
+            continue
+
+        # Duplicate Schutz
+        if tweet_id and tweet_id in processed_ids:
+            print("Duplicate ID übersprungen")
+            continue
+
+        if text == last_text:
+            print("Duplicate Text übersprungen")
+            continue
+
+        if tweet_id:
+            processed_ids.add(tweet_id)
+
+        last_text = text
+
+        print("Neuer Tweet:", text)
+
+        # Übersetzen
+        title, summary = await translate_tweet(text)
+
+        # Discord senden
+        await send_to_discord(url, title, summary)
+
+
+# --------------------------------------------------
+# Webhook Endpoint
+# --------------------------------------------------
 
 @app.post("/wg-stream")
-async def wg_stream(request: Request):
-    global last_text, processed_ids
+async def wg_stream(request: Request, background_tasks: BackgroundTasks):
 
     try:
+
         payload = await request.json()
+
     except Exception:
+
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    try:
-        tweets = payload.get("data", {}).get("tweets", [])
-        if not tweets:
-            return JSONResponse({"status": "no_tweets"})
+    # Verarbeitung im Hintergrund starten
+    background_tasks.add_task(process_tweets, payload)
 
-        for t in tweets:
-            tweet_id = t.get("id")
-            text = t.get("text", "")
-            url = t.get("url") or t.get("twitterUrl")
-
-            if not url or not text:
-                continue
-
-            # Duplikate vermeiden
-            if tweet_id in processed_ids or text == last_text:
-                continue
-
-            processed_ids.add(tweet_id)
-            last_text = text
-
-            # GPT-Übersetzung holen
-            title_de, summary_de = await translate_tweet(text)
-
-            # An Discord schicken (zwei Nachrichten)
-            await send_to_discord(url, title_de, summary_de)
-
-        return JSONResponse({"status": "ok"})
-
-    except Exception as e:
-        print("Fehler im /wg-stream Handler:", e)
-        return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
+    # sofort antworten (wichtig für Webhooks)
+    return JSONResponse({"status": "received"})

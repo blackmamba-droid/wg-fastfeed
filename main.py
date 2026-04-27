@@ -9,8 +9,24 @@ load_dotenv()
 
 app = FastAPI()
 
-# Cache gegen doppelte Tweets
-processed_ids = set()
+SEEN_IDS_FILE = os.path.join(os.path.dirname(__file__), "seen_ids.json")
+MAX_SEEN_IDS = 2000
+
+def _load_seen_ids() -> set:
+    try:
+        with open(SEEN_IDS_FILE, "r") as f:
+            return set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+def _save_seen_ids(ids: set):
+    # Nur die letzten MAX_SEEN_IDS behalten damit die Datei nicht endlos wächst
+    trimmed = list(ids)[-MAX_SEEN_IDS:]
+    with open(SEEN_IDS_FILE, "w") as f:
+        json.dump(trimmed, f)
+
+# Cache gegen doppelte Tweets (persistent über Neustarts)
+processed_ids: set = _load_seen_ids()
 last_text = None
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -230,6 +246,7 @@ async def process_tweets(payload):
 
         if tweet_id:
             processed_ids.add(tweet_id)
+            _save_seen_ids(processed_ids)
 
         last_text = text
 

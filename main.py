@@ -221,7 +221,7 @@ async def send_to_discord(url: str, title: str, summary: str, source_name: str, 
 
         try:
             if webhook_key == "vip":
-                text = f"**DE:** {title}\n\n{summary}"
+                text = f"**DE:** {title}"
             else:
                 text = f"**DE:** {title}\n\n{summary}\n\nQuelle: {source_name} • Übersetzt per KI"
             r2 = await client.post(webhook_url, json={"content": text[:2000]})

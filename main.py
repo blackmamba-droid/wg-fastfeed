@@ -272,6 +272,15 @@ async def process_tweets(payload):
 
         source_name, webhook_key = detect_source(t, payload)
 
+        # Für VIP: nur Original-Tweets von @DeItaone, keine Retweets/Replies
+        if webhook_key == "vip":
+            if t.get("retweeted_tweet") or t.get("retweetedTweet"):
+                print("VIP Retweet übersprungen")
+                continue
+            if t.get("isReply") or t.get("is_reply"):
+                print("VIP Reply übersprungen")
+                continue
+
         # Zeitbasierter Filter (persistenter Schutz über Neustarts)
         if tweet_too_old(t, webhook_key):
             continue

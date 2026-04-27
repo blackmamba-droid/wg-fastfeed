@@ -193,7 +193,10 @@ async def send_to_discord(url: str, title: str, summary: str, source_name: str, 
             print("Discord Embed Fehler:", e)
 
         try:
-            text = f"**DE:** {title}\n\n{summary}\n\nQuelle: {source_name} • Übersetzt per KI"
+            if webhook_key == "vip":
+                text = f"**DE:** {title}\n\n{summary}"
+            else:
+                text = f"**DE:** {title}\n\n{summary}\n\nQuelle: {source_name} • Übersetzt per KI"
             r2 = await client.post(webhook_url, json={"content": text[:2000]})
             print(f"Discord text [{webhook_key}]:", r2.status_code)
         except Exception as e:

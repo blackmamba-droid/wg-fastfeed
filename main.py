@@ -30,7 +30,7 @@ MAX_AGE = {
 # Twitter-Username (lowercase) → (Anzeigename, webhook_key)
 SOURCES = {
     "watcherguru": ("WatcherGuru", "default"),
-    "deltaone":    ("Walter Bloomberg", "vip"),
+    "deitaone":    ("Walter Bloomberg", "vip"),  # @DeItaone (capital I)
 }
 
 
@@ -41,9 +41,8 @@ SOURCES = {
 def tweet_too_old(t: dict, webhook_key: str) -> bool:
     """True wenn der Tweet älter als MAX_AGE ist."""
     raw = (
-        t.get("created_at")
-        or t.get("createdAt")
-        or t.get("timestamp")
+        t.get("createdAt")
+        or t.get("created_at")
         or t.get("date")
     )
     if not raw:
@@ -51,11 +50,15 @@ def tweet_too_old(t: dict, webhook_key: str) -> bool:
 
     try:
         if isinstance(raw, (int, float)):
-            # Unix timestamp (Sekunden oder Millisekunden)
             ts = raw / 1000 if raw > 1e10 else raw
             created = datetime.fromtimestamp(ts, tz=timezone.utc)
         else:
-            created = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            raw_str = str(raw)
+            try:
+                # Twitter-Format: "Mon Apr 27 12:05:50 +0000 2026"
+                created = datetime.strptime(raw_str, "%a %b %d %H:%M:%S +0000 %Y").replace(tzinfo=timezone.utc)
+            except ValueError:
+                created = datetime.fromisoformat(raw_str.replace("Z", "+00:00"))
 
         age = datetime.now(tz=timezone.utc) - created
         limit = MAX_AGE.get(webhook_key, timedelta(minutes=10))
@@ -75,7 +78,15 @@ def tweet_too_old(t: dict, webhook_key: str) -> bool:
 def detect_source(t: dict, payload: dict) -> tuple[str, str]:
     """Gibt (anzeigename, webhook_key) zurück."""
 
-    # 1. Matching Rule Tag prüfen (zuverlässigste Methode)
+    # 1. Rule Tag prüfen — twitterapi.io liefert ihn direkt im Payload
+    rule_tag = (payload.get("rule_tag") or "").lower()
+    if rule_tag:
+        if "vip" in rule_tag or "bloomberg" in rule_tag or "deitaone" in rule_tag:
+            return "Walter Bloomberg", "vip"
+        if "watcherguru" in rule_tag or "watcher" in rule_tag:
+            return "WatcherGuru", "default"
+
+    # Fallback: matching_rules Array
     rules = (
         payload.get("matching_rules")
         or payload.get("matchingRules")
@@ -84,7 +95,7 @@ def detect_source(t: dict, payload: dict) -> tuple[str, str]:
     )
     for rule in rules:
         tag = (rule.get("tag") or "").lower()
-        if "vip" in tag or "bloomberg" in tag or "deltaone" in tag:
+        if "vip" in tag or "bloomberg" in tag or "deitaone" in tag:
             return "Walter Bloomberg", "vip"
         if "watcherguru" in tag or "watcher" in tag:
             return "WatcherGuru", "default"
@@ -93,9 +104,11 @@ def detect_source(t: dict, payload: dict) -> tuple[str, str]:
     author_candidates = [
         t.get("authorUsername", ""),
         t.get("author_username", ""),
+        (t.get("author") or {}).get("userName", ""),   # twitterapi.io: camelCase
         (t.get("author") or {}).get("username", ""),
         (t.get("author") or {}).get("screen_name", ""),
         (t.get("user") or {}).get("screen_name", ""),
+        (t.get("user") or {}).get("userName", ""),
         (t.get("user") or {}).get("username", ""),
     ]
     for candidate in author_candidates:

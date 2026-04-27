@@ -20,28 +20,76 @@ def _load_seen_ids() -> set:
         return set()
 
 def _save_seen_ids(ids: set):
-    # Nur die letzten MAX_SEEN_IDS behalten damit die Datei nicht endlos wächst
     trimmed = list(ids)[-MAX_SEEN_IDS:]
     with open(SEEN_IDS_FILE, "w") as f:
         json.dump(trimmed, f)
 
-# Cache gegen doppelte Tweets (persistent über Neustarts)
 processed_ids: set = _load_seen_ids()
 last_text = None
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")           # WatcherGuru → normaler Channel
+DISCORD_WEBHOOK_URL_VIP = os.getenv("DISCORD_WEBHOOK_URL_VIP")  # Deltaone/Bloomberg → VIP Channel
 
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_MODEL = "gpt-4.1-nano"
 
+# Twitter-Username (lowercase) → (Anzeigename, webhook_key)
+SOURCES = {
+    "watcherguru": ("WatcherGuru", "default"),
+    "deltaone":    ("Walter Bloomberg", "vip"),
+}
+
 
 # --------------------------------------------------
-# GPT Übersetzung
+# Autor-Erkennung
 # --------------------------------------------------
 
-async def is_whale_buy_sell(text: str):
+def detect_source(t: dict, payload: dict) -> tuple[str, str]:
+    """Gibt (anzeigename, webhook_key) zurück."""
 
+    # 1. Matching Rule Tag aus dem Payload prüfen (zuverlässigste Methode)
+    rules = (
+        payload.get("matching_rules")
+        or payload.get("matchingRules")
+        or (payload.get("data") or {}).get("matching_rules", [])
+        or []
+    )
+    for rule in rules:
+        tag = (rule.get("tag") or "").lower()
+        if "vip" in tag or "bloomberg" in tag or "deltaone" in tag:
+            return "Walter Bloomberg", "vip"
+        if "watcherguru" in tag or "watcher" in tag:
+            return "WatcherGuru", "default"
+
+    # 2. Tweet-Autor-Felder prüfen
+    author_candidates = [
+        t.get("authorUsername", ""),
+        t.get("author_username", ""),
+        (t.get("author") or {}).get("username", ""),
+        (t.get("author") or {}).get("screen_name", ""),
+        (t.get("user") or {}).get("screen_name", ""),
+        (t.get("user") or {}).get("username", ""),
+    ]
+    for candidate in author_candidates:
+        key = candidate.lower().lstrip("@")
+        if key in SOURCES:
+            return SOURCES[key]
+
+    # 3. Fallback: Autor aus der Tweet-URL lesen
+    url = t.get("url") or t.get("twitterUrl") or ""
+    for username_lower, (display, webhook_key) in SOURCES.items():
+        if f"/{username_lower}/" in url.lower():
+            return display, webhook_key
+
+    return "WatcherGuru", "default"
+
+
+# --------------------------------------------------
+# GPT Filter & Übersetzung
+# --------------------------------------------------
+
+async def is_whale_buy_sell(text: str) -> bool:
     if not OPENAI_API_KEY:
         return False
 
@@ -75,34 +123,21 @@ async def is_whale_buy_sell(text: str):
             {"role": "user", "content": text},
         ],
         "temperature": 0,
-        "max_tokens": 3
+        "max_tokens": 3,
     }
 
     try:
-
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                OPENAI_API_URL,
-                headers=headers,
-                json=body,
-            )
-
-        data = resp.json()
-
-        decision = data["choices"][0]["message"]["content"].strip()
-
+            resp = await client.post(OPENAI_API_URL, headers=headers, json=body)
+        decision = resp.json()["choices"][0]["message"]["content"].strip()
         print("Whale Buy/Sell Bewertung:", decision)
-
         return decision == "YES"
-
     except Exception as e:
-
         print("Filter Fehler:", e)
-
         return False
 
-async def translate_tweet(text: str):
 
+async def translate_tweet(text: str) -> tuple[str, str]:
     if not OPENAI_API_KEY:
         return text[:120], "Automatische Zusammenfassung nicht verfügbar."
 
@@ -112,7 +147,7 @@ async def translate_tweet(text: str):
     }
 
     system_prompt = (
-        "Du bist ein deutschsprachiger News-Redakteur.\n"
+        "Du bist ein deutschsprachiger Finanz- und Markt-News-Redakteur.\n"
         "Übersetze die Überschrift des Tweets möglichst nah ins Deutsche "
         "und fasse den Inhalt in 1-3 Sätzen neutral zusammen.\n"
         "Antworte als JSON: {\"title\": \"...\", \"summary\": \"...\"}"
@@ -128,31 +163,14 @@ async def translate_tweet(text: str):
     }
 
     try:
-
         async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                OPENAI_API_URL,
-                headers=headers,
-                json=body,
-            )
-
+            resp = await client.post(OPENAI_API_URL, headers=headers, json=body)
             resp.raise_for_status()
-
-        data = resp.json()
-
-        content = data["choices"][0]["message"]["content"]
-
+        content = resp.json()["choices"][0]["message"]["content"]
         obj = json.loads(content)
-
-        title = obj.get("title", text[:120])
-        summary = obj.get("summary", "Zusammenfassung nicht verfügbar.")
-
-        return title, summary
-
+        return obj.get("title", text[:120]), obj.get("summary", "Zusammenfassung nicht verfügbar.")
     except Exception as e:
-
         print("GPT Fehler:", e)
-
         return text[:120], "Automatische Übersetzung aktuell nicht verfügbar."
 
 
@@ -160,41 +178,25 @@ async def translate_tweet(text: str):
 # Discord Versand
 # --------------------------------------------------
 
-async def send_to_discord(url: str, title: str, summary: str):
+async def send_to_discord(url: str, title: str, summary: str, source_name: str, webhook_key: str):
+    webhook_url = DISCORD_WEBHOOK_URL_VIP if webhook_key == "vip" else DISCORD_WEBHOOK_URL
 
-    if not DISCORD_WEBHOOK_URL:
-        print("Discord Webhook fehlt.")
+    if not webhook_url:
+        print(f"Discord Webhook fehlt für: {webhook_key}")
         return
 
     async with httpx.AsyncClient(timeout=10) as client:
-
         try:
-
-            # Tweet Embed
-            r1 = await client.post(
-                DISCORD_WEBHOOK_URL,
-                json={"content": url},
-            )
-
-            print("Discord embed status:", r1.status_code)
-
+            r1 = await client.post(webhook_url, json={"content": url})
+            print(f"Discord embed [{webhook_key}]:", r1.status_code)
         except Exception as e:
-
             print("Discord Embed Fehler:", e)
 
         try:
-
-            text = f"**DE:** {title}\n\n{summary}\n\nQuelle: WatcherGuru • Übersetzt per KI"
-
-            r2 = await client.post(
-                DISCORD_WEBHOOK_URL,
-                json={"content": text[:2000]},
-            )
-
-            print("Discord text status:", r2.status_code)
-
+            text = f"**DE:** {title}\n\n{summary}\n\nQuelle: {source_name} • Übersetzt per KI"
+            r2 = await client.post(webhook_url, json={"content": text[:2000]})
+            print(f"Discord text [{webhook_key}]:", r2.status_code)
         except Exception as e:
-
             print("Discord Text Fehler:", e)
 
 
@@ -203,31 +205,21 @@ async def send_to_discord(url: str, title: str, summary: str):
 # --------------------------------------------------
 
 async def process_tweets(payload):
-
-    global last_text
-    global processed_ids
+    global last_text, processed_ids
 
     print("Webhook Payload:", payload)
 
     tweets = []
-
-    # verschiedene mögliche Payload Strukturen
     if isinstance(payload.get("data"), dict):
-
         tweets = payload["data"].get("tweets", [])
-
     elif isinstance(payload.get("data"), list):
-
         tweets = payload["data"]
-
     else:
-
         tweets = payload.get("tweets", [])
 
     print("Tweets erkannt:", len(tweets))
 
     for t in tweets:
-
         tweet_id = t.get("id")
         text = t.get("text", "")
         url = t.get("url") or t.get("twitterUrl")
@@ -235,7 +227,6 @@ async def process_tweets(payload):
         if not text or not url:
             continue
 
-        # Duplicate Schutz
         if tweet_id and tweet_id in processed_ids:
             print("Duplicate ID übersprungen")
             continue
@@ -250,20 +241,17 @@ async def process_tweets(payload):
 
         last_text = text
 
-        print("Neuer Tweet:", text)
+        source_name, webhook_key = detect_source(t, payload)
+        print(f"Neuer Tweet von {source_name} [{webhook_key}]:", text)
 
-        # Whale Buy/Sell Filter
-        is_whale_trade = await is_whale_buy_sell(text)
+        # Whale-Filter nur für WatcherGuru
+        if webhook_key == "default":
+            if await is_whale_buy_sell(text):
+                print("Whale Buy/Sell ignoriert:", text)
+                continue
 
-        if is_whale_trade:
-            print("Whale Buy/Sell ignoriert:", text)
-            continue
-
-        # Übersetzen
         title, summary = await translate_tweet(text)
-
-        # Discord senden
-        await send_to_discord(url, title, summary)
+        await send_to_discord(url, title, summary, source_name, webhook_key)
 
 
 # --------------------------------------------------
@@ -272,17 +260,10 @@ async def process_tweets(payload):
 
 @app.post("/wg-stream")
 async def wg_stream(request: Request, background_tasks: BackgroundTasks):
-
     try:
-
         payload = await request.json()
-
     except Exception:
-
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    # Verarbeitung im Hintergrund starten
     background_tasks.add_task(process_tweets, payload)
-
-    # sofort antworten (wichtig für Webhooks)
     return JSONResponse({"status": "received"})

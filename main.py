@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse
+from datetime import datetime, timezone, timedelta
 import json
 import os
 import httpx
@@ -9,22 +10,8 @@ load_dotenv()
 
 app = FastAPI()
 
-SEEN_IDS_FILE = os.path.join(os.path.dirname(__file__), "seen_ids.json")
-MAX_SEEN_IDS = 2000
-
-def _load_seen_ids() -> set:
-    try:
-        with open(SEEN_IDS_FILE, "r") as f:
-            return set(json.load(f))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return set()
-
-def _save_seen_ids(ids: set):
-    trimmed = list(ids)[-MAX_SEEN_IDS:]
-    with open(SEEN_IDS_FILE, "w") as f:
-        json.dump(trimmed, f)
-
-processed_ids: set = _load_seen_ids()
+# In-memory deduplication (schneller Schutz innerhalb einer Session)
+processed_ids: set = set()
 last_text = None
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -34,11 +21,51 @@ DISCORD_WEBHOOK_URL_VIP = os.getenv("DISCORD_WEBHOOK_URL_VIP")  # Deltaone/Bloom
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_MODEL = "gpt-4.1-nano"
 
+# Max. Alter eines Tweets je Quelle (persistenter Schutz über Neustarts)
+MAX_AGE = {
+    "default": timedelta(minutes=10),  # WatcherGuru pollt alle 5 min
+    "vip":     timedelta(minutes=3),   # Deltaone pollt alle 1 min
+}
+
 # Twitter-Username (lowercase) → (Anzeigename, webhook_key)
 SOURCES = {
     "watcherguru": ("WatcherGuru", "default"),
     "deltaone":    ("Walter Bloomberg", "vip"),
 }
+
+
+# --------------------------------------------------
+# Alter des Tweets prüfen
+# --------------------------------------------------
+
+def tweet_too_old(t: dict, webhook_key: str) -> bool:
+    """True wenn der Tweet älter als MAX_AGE ist."""
+    raw = (
+        t.get("created_at")
+        or t.get("createdAt")
+        or t.get("timestamp")
+        or t.get("date")
+    )
+    if not raw:
+        return False  # kein Timestamp → lieber durchlassen
+
+    try:
+        if isinstance(raw, (int, float)):
+            # Unix timestamp (Sekunden oder Millisekunden)
+            ts = raw / 1000 if raw > 1e10 else raw
+            created = datetime.fromtimestamp(ts, tz=timezone.utc)
+        else:
+            created = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+
+        age = datetime.now(tz=timezone.utc) - created
+        limit = MAX_AGE.get(webhook_key, timedelta(minutes=10))
+        if age > limit:
+            print(f"Tweet zu alt ({age}), übersprungen")
+            return True
+    except Exception as e:
+        print("Timestamp-Fehler:", e)
+
+    return False
 
 
 # --------------------------------------------------
@@ -48,7 +75,7 @@ SOURCES = {
 def detect_source(t: dict, payload: dict) -> tuple[str, str]:
     """Gibt (anzeigename, webhook_key) zurück."""
 
-    # 1. Matching Rule Tag aus dem Payload prüfen (zuverlässigste Methode)
+    # 1. Matching Rule Tag prüfen (zuverlässigste Methode)
     rules = (
         payload.get("matching_rules")
         or payload.get("matchingRules")
@@ -230,6 +257,13 @@ async def process_tweets(payload):
         if not text or not url:
             continue
 
+        source_name, webhook_key = detect_source(t, payload)
+
+        # Zeitbasierter Filter (persistenter Schutz über Neustarts)
+        if tweet_too_old(t, webhook_key):
+            continue
+
+        # In-memory Duplikatschutz (schneller Schutz innerhalb einer Session)
         if tweet_id and tweet_id in processed_ids:
             print("Duplicate ID übersprungen")
             continue
@@ -240,11 +274,9 @@ async def process_tweets(payload):
 
         if tweet_id:
             processed_ids.add(tweet_id)
-            _save_seen_ids(processed_ids)
 
         last_text = text
 
-        source_name, webhook_key = detect_source(t, payload)
         print(f"Neuer Tweet von {source_name} [{webhook_key}]:", text)
 
         # Whale-Filter nur für WatcherGuru
